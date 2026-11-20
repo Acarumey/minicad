@@ -1,0 +1,822 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>MiniCAD - простой 2D САПР</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;overflow:hidden;font-family:'Segoe UI',Arial,sans-serif}
+body{display:flex;flex-direction:column}
+#toolbar{display:flex;flex-wrap:wrap;gap:4px;padding:6px;background:#223140;flex:none}
+#toolbar button{border:0;border-radius:6px;padding:7px 12px;background:#33506b;color:#fff;font-size:13px;cursor:pointer;user-select:none}
+#toolbar button:hover{background:#41678a}
+#toolbar button.on{background:#2e86de}
+#toolbar button.green{background:#27ae60}
+#toolbar button.green.on{background:#1e8449}
+#main{flex:1;position:relative;min-height:0}
+#cv{position:absolute;left:0;top:0;width:100%;height:100%;touch-action:none;background:#f5f4ef;cursor:crosshair;display:block}
+#status{flex:none;height:26px;background:#223140;color:#cfd8e3;font-size:12px;display:flex;align-items:center;padding:0 10px;gap:18px;white-space:nowrap;overflow:hidden}
+#panel{position:absolute;top:10px;right:10px;width:235px;background:#fff;border-radius:8px;box-shadow:0 2px 10px rgba(0,0,0,.25);padding:10px;font-size:13px;z-index:6}
+#panel h4{margin-bottom:6px}
+#panel input{width:100%;padding:4px;border:1px solid #bbb;border-radius:4px;margin:3px 0;font-size:13px}
+#panel button{width:100%;padding:6px;border:0;border-radius:5px;background:#2e86de;color:#fff;cursor:pointer;margin-top:4px}
+#panel label{display:flex;align-items:center;gap:6px;padding:3px 0}
+#panel .sw{display:inline-block;width:12px;height:12px;border-radius:3px}
+</style>
+</head>
+<body>
+<div id="toolbar">
+ <button data-tool="select" class="on">Выбор</button>
+ <button data-tool="line">Отрезок</button>
+ <button data-tool="poly">Контур</button>
+ <button data-tool="rect">Прямоуг.</button>
+ <button data-tool="circle">Окружн.</button>
+ <button data-tool="arc">Дуга</button>
+ <button data-tool="dim">Размер</button>
+ <button data-tool="text">Текст</button>
+ <button id="bGrid" class="green on">Сетка</button>
+ <button id="bOrtho" class="green">Орто</button>
+ <button id="bSnap" class="green on">Привязка</button>
+ <button id="bUndo">Отменить</button>
+ <button id="bRedo">Вернуть</button>
+ <button id="bDel">Удалить</button>
+ <button id="bArr">Массив</button>
+ <button id="bLayers">Слои</button>
+ <button id="bStamp">Штамп</button>
+ <button id="bDxf">DXF</button>
+ <button id="bPng">PNG</button>
+ <button id="bOpen">Открыть</button>
+ <button id="bSave">Сохранить</button>
+ <button id="bFit">Всё</button>
+ <button id="bClear">Очистить</button>
+</div>
+<div id="main">
+ <canvas id="cv"></canvas>
+ <div id="panel" style="display:none">
+  <div id="boxProps" style="display:none">
+   <h4>Свойства</h4>
+   <div id="propFields"></div>
+   <button id="bApply">Применить</button>
+  </div>
+  <div id="boxPoint" style="display:none">
+   <h4>Точная точка</h4>
+   X <input id="inX" type="number" step="any">
+   Y <input id="inY" type="number" step="any">
+   <button id="bPt">Поставить точку</button>
+   <button id="bEnd">Завершить контур</button>
+  </div>
+  <div id="boxLayers" style="display:none">
+   <h4>Слои</h4>
+   <div id="layerList"></div>
+  </div>
+ </div>
+</div>
+<div id="status">
+ <span id="stXY">X: 0.0  Y: 0.0</span>
+ <span id="stZ">100%</span>
+ <span id="stH"></span>
+</div>
+<input type="file" id="fileIn" accept=".json,application/json" style="display:none">
+<script>
+
+'use strict';
+var cv=document.getElementById('cv');
+var ctx=cv.getContext('2d');
+var GRID=10;
+var shapes=[];
+var layers=[
+ {name:'Основной',vis:true,col:'#1a1a1a'},
+ {name:'Осевые',vis:true,col:'#c0392b'},
+ {name:'Размеры',vis:true,col:'#2266cc'}
+];
+var curLayer=0;
+var tool='select';
+var drawing=null;
+var sel=-1;
+var mouse=[0,0];
+var view={s:2,ox:0,oy:0};
+var snapOn=true,orthoOn=false,gridOn=true,stampOn=false;
+var stampName='Деталь';
+var spaceDown=false,shiftKey=false;
+var undoStack=[],redoStack=[];
+var pan=null,pinch=null,drag=null;
+var pointers={};
+var layersBoxOpen=false;
+var propInputs=[],propText=null;
+
+// ---- координаты: мировые <-> экранные ----
+function w2sx(x){return x*view.s+view.ox;}
+function w2sy(y){return -y*view.s+view.oy;}
+function s2wx(x){return (x-view.ox)/view.s;}
+function s2wy(y){return (view.oy-y)/view.s;}
+
+function resize(){
+ var r=cv.getBoundingClientRect();
+ cv.width=Math.max(1,Math.round(r.width));
+ cv.height=Math.max(1,Math.round(r.height));
+ draw();
+}
+function sn(p){
+ if(!snapOn)return [p[0],p[1]];
+ return [Math.round(p[0]/GRID)*GRID,Math.round(p[1]/GRID)*GRID];
+}
+function orthoPt(a,b){
+ if(!orthoOn&&!shiftKey)return [b[0],b[1]];
+ var dx=Math.abs(b[0]-a[0]),dy=Math.abs(b[1]-a[1]);
+ return dx>dy?[b[0],a[1]]:[a[0],b[1]];
+}
+
+// ---- отмена/возврат ----
+function curState(){
+ return JSON.stringify({shapes:shapes,layers:layers,stampOn:stampOn,stampName:stampName});
+}
+function applyState(st){
+ shapes=st.shapes;layers=st.layers||layers;
+ stampOn=!!st.stampOn;stampName=st.stampName||'Деталь';
+ if(curLayer>=layers.length)curLayer=0;
+ document.getElementById('bStamp').classList.toggle('on',stampOn);
+ renderLayers();
+}
+function snapUndo(){
+ undoStack.push(curState());
+ if(undoStack.length>80)undoStack.shift();
+ redoStack.length=0;
+}
+function undo(){
+ if(!undoStack.length)return;
+ redoStack.push(curState());
+ applyState(JSON.parse(undoStack.pop()));
+ sel=-1;showProps();draw();updateStatus();
+}
+function redo(){
+ if(!redoStack.length)return;
+ undoStack.push(curState());
+ applyState(JSON.parse(redoStack.pop()));
+ sel=-1;showProps();draw();updateStatus();
+}
+
+// ---- ввод точки инструментом ----
+function commit(p){
+ var a=drawing.a,b=orthoPt(a,p);
+ if(tool==='line'){snapUndo();shapes.push({type:'line',a:a,b:b,l:curLayer});drawing=null;}
+ else if(tool==='rect'){snapUndo();shapes.push({type:'rect',a:[Math.min(a[0],b[0]),Math.min(a[1],b[1])],b:[Math.max(a[0],b[0]),Math.max(a[1],b[1])],l:curLayer});drawing=null;}
+ else if(tool==='circle'){snapUndo();shapes.push({type:'circle',c:a,r:Math.max(0.01,Math.hypot(p[0]-a[0],p[1]-a[1])),l:curLayer});drawing=null;}
+ showProps();
+}
+function finishArc(p){
+ var c=drawing.c,p1=drawing.p1;
+ var r=Math.hypot(p1[0]-c[0],p1[1]-c[1]);
+ var a1=Math.atan2(p1[1]-c[1],p1[0]-c[0]);
+ var a2=Math.atan2(p[1]-c[1],p[0]-c[0]);
+ if(r>0.01){snapUndo();shapes.push({type:'arc',c:c,r:r,a1:a1,a2:a2,l:curLayer});}
+ drawing=null;showProps();
+}
+function endPoly(){
+ if(drawing&&drawing.type==='poly'&&drawing.pts.length>=2){
+  snapUndo();shapes.push({type:'poly',pts:drawing.pts.slice(),l:curLayer});
+ }
+ drawing=null;showProps();draw();updateStatus();
+}
+function toolDown(w){
+ var p=sn(w);
+ if(tool==='text'){
+  var t=prompt('Введите текст:','');
+  if(t!==null&&t!==''){snapUndo();shapes.push({type:'text',p:[p[0],p[1]],t:t,l:curLayer});draw();updateStatus();}
+  return;
+ }
+ if(tool==='arc'){
+  if(!drawing)drawing={type:'arc',c:p.slice(),cur:p.slice()};
+  else if(!drawing.p1)drawing.p1=p.slice();
+  else finishArc(p);
+  showProps();draw();updateStatus();return;
+ }
+ if(tool==='dim'){
+  if(!drawing)drawing={type:'dim',a:p.slice(),cur:p.slice()};
+  else{snapUndo();shapes.push({type:'dim',a:drawing.a,b:p.slice(),l:2});drawing=null;showProps();}
+  draw();updateStatus();return;
+ }
+ if(tool==='poly'){
+  if(!drawing)drawing={type:'poly',pts:[p.slice()],cur:p.slice()};
+  else{drawing.pts.push(orthoPt(drawing.pts[drawing.pts.length-1],p));drawing.cur=drawing.pts[drawing.pts.length-1].slice();}
+  showProps();draw();updateStatus();return;
+ }
+ if(!drawing)drawing={type:tool,a:p.slice(),cur:p.slice()};
+ else commit(p);
+ draw();updateStatus();
+}
+
+// ---- события указателя (мышь, тачпад, сенсор) ----
+function getW(e){
+ var r=cv.getBoundingClientRect();
+ return [s2wx(e.clientX-r.left),s2wy(e.clientY-r.top)];
+}
+cv.addEventListener('pointerdown',function(e){
+ e.preventDefault();
+ try{cv.setPointerCapture(e.pointerId);}catch(err){}
+ pointers[e.pointerId]=[e.clientX,e.clientY];
+ var keys=Object.keys(pointers);
+ if(keys.length===2){
+  drawing=null;drag=null;pan=null;
+  var p1=pointers[keys[0]],p2=pointers[keys[1]];
+  pinch={d0:Math.max(10,Math.hypot(p2[0]-p1[0],p2[1]-p1[1])),s0:view.s,
+   cx:(p1[0]+p2[0])/2,cy:(p1[1]+p2[1])/2};
+  return;
+ }
+ if(e.button===1||e.button===2||spaceDown){pan=[e.clientX,e.clientY];return;}
+ var w=getW(e);
+ if(tool==='select'){
+  sel=hitTest(w);
+  if(sel>=0){
+   drag={id:e.pointerId,start:w.slice(),orig:JSON.parse(JSON.stringify(shapes[sel])),pre:curState(),moved:false};
+  }
+  showProps();draw();updateStatus();return;
+ }
+ toolDown(w);
+});
+cv.addEventListener('pointermove',function(e){
+ var r=cv.getBoundingClientRect();
+ var mx=e.clientX-r.left,my=e.clientY-r.top;
+ mouse=[s2wx(mx),s2wy(my)];
+ if(pointers[e.pointerId])pointers[e.pointerId]=[e.clientX,e.clientY];
+ var keys=Object.keys(pointers);
+ if(keys.length>=2&&pinch){pinchMove();draw();updateStatus();return;}
+ if(pan){view.ox+=e.clientX-pan[0];view.oy+=e.clientY-pan[1];pan=[e.clientX,e.clientY];draw();updateStatus();return;}
+ if(drag&&drag.id===e.pointerId){
+  var dx=mouse[0]-drag.start[0],dy=mouse[1]-drag.start[1];
+  if(!drag.moved){
+   if(Math.hypot(dx,dy)*view.s<4)return;
+   drag.moved=true;undoStack.push(drag.pre);redoStack.length=0;
+  }
+  shapes[sel]=moveShape(drag.orig,dx,dy);
+  draw();updateStatus();return;
+ }
+ if(drawing){
+  if(drawing.type==='poly')drawing.cur=orthoPt(drawing.pts[drawing.pts.length-1],mouse);
+  else if(drawing.type==='arc'||drawing.type==='circle')drawing.cur=sn(mouse).slice();
+  else drawing.cur=orthoPt(drawing.a,mouse);
+ }
+ draw();updateStatus();
+});
+function pointerEnd(e){
+ delete pointers[e.pointerId];
+ if(pinch&&Object.keys(pointers).length<2)pinch=null;
+ if(pan){pan=null;return;}
+ if(drag){drag=null;showProps();return;}
+}
+cv.addEventListener('pointerup',pointerEnd);
+cv.addEventListener('pointercancel',pointerEnd);
+cv.addEventListener('contextmenu',function(e){e.preventDefault();});
+cv.addEventListener('dblclick',function(e){
+ if(tool==='poly'||(drawing&&drawing.type==='poly'))endPoly();
+});
+cv.addEventListener('wheel',function(e){
+ e.preventDefault();
+ var r=cv.getBoundingClientRect();
+ var mx=e.clientX-r.left,my=e.clientY-r.top;
+ var wx=s2wx(mx),wy=s2wy(my);
+ var f=e.deltaY<0?1.12:1/1.12;
+ var ns=Math.max(0.05,Math.min(200,view.s*f));
+ view.s=ns;
+ view.ox=mx-wx*ns;
+ view.oy=my+wy*ns;
+ draw();updateStatus();
+},{passive:false});
+function pinchMove(){
+ var keys=Object.keys(pointers);
+ var p1=pointers[keys[0]],p2=pointers[keys[1]];
+ var d=Math.max(10,Math.hypot(p2[0]-p1[0],p2[1]-p1[1]));
+ var cx=(p1[0]+p2[0])/2,cy=(p1[1]+p2[1])/2;
+ var wx=s2wx(pinch.cx),wy=s2wy(pinch.cy);
+ var ns=Math.max(0.05,Math.min(200,pinch.s0*d/pinch.d0));
+ view.s=ns;
+ view.ox=cx-wx*ns;
+ view.oy=cy+wy*ns;
+}
+
+// ---- клавиатура ----
+window.addEventListener('keydown',function(e){
+ var tag=(e.target&&e.target.tagName)||'';
+ if(tag==='INPUT'||tag==='TEXTAREA')return;
+ shiftKey=e.shiftKey;
+ if(e.code==='Space'){spaceDown=true;e.preventDefault();return;}
+ if(e.ctrlKey&&e.code==='KeyZ'){undo();e.preventDefault();return;}
+ if(e.ctrlKey&&e.code==='KeyY'){redo();e.preventDefault();return;}
+ if(e.code==='Escape'){if(drawing&&drawing.type==='poly'){drawing=null;}drawing=null;sel=-1;showProps();draw();updateStatus();return;}
+ if(e.code==='Enter'){if(drawing&&drawing.type==='poly')endPoly();return;}
+ if(e.code==='Delete'){delSel();return;}
+ if(e.code==='KeyL')setTool('line');
+ else if(e.code==='KeyR')setTool('rect');
+ else if(e.code==='KeyC')setTool('circle');
+ else if(e.code==='KeyV')setTool('select');
+ else if(e.code==='KeyT')setTool('text');
+ else if(e.code==='KeyF')fitAll();
+});
+window.addEventListener('keyup',function(e){spaceDown=false;shiftKey=e.shiftKey;});
+
+// ---- геометрия: попадание и перемещение ----
+function distSeg(p,a,b){
+ var vx=b[0]-a[0],vy=b[1]-a[1];
+ var L2=vx*vx+vy*vy;
+ if(L2<1e-12)return Math.hypot(p[0]-a[0],p[1]-a[1]);
+ var t=((p[0]-a[0])*vx+(p[1]-a[1])*vy)/L2;
+ t=Math.max(0,Math.min(1,t));
+ return Math.hypot(p[0]-(a[0]+t*vx),p[1]-(a[1]+t*vy));
+}
+function angIn(an,a1,a2){
+ var lo=Math.min(a1,a2),hi=Math.max(a1,a2);
+ while(an<lo-1e-9)an+=Math.PI*2;
+ while(an>hi+1e-9)an-=Math.PI*2;
+ return an>=lo-1e-9&&an<=hi+1e-9;
+}
+function hitTest(w){
+ var tol=8/view.s;
+ for(var i=shapes.length-1;i>=0;i--){
+  var s=shapes[i];
+  if(!layerVis(s.l))continue;
+  var d=1e9,j;
+  if(s.type==='line'||s.type==='dim')d=distSeg(w,s.a,s.b);
+  else if(s.type==='rect'){
+   d=Math.min(
+    distSeg(w,[s.a[0],s.a[1]],[s.b[0],s.a[1]]),
+    distSeg(w,[s.b[0],s.a[1]],[s.b[0],s.b[1]]),
+    distSeg(w,[s.b[0],s.b[1]],[s.a[0],s.b[1]]),
+    distSeg(w,[s.a[0],s.b[1]],[s.a[0],s.a[1]]));
+  }else if(s.type==='circle')d=Math.abs(Math.hypot(w[0]-s.c[0],w[1]-s.c[1])-s.r);
+  else if(s.type==='arc'){
+   var dd=Math.abs(Math.hypot(w[0]-s.c[0],w[1]-s.c[1])-s.r);
+   d=angIn(Math.atan2(w[1]-s.c[1],w[0]-s.c[0]),s.a1,s.a2)?dd:1e9;
+  }else if(s.type==='poly'){
+   d=1e9;
+   for(j=0;j<s.pts.length-1;j++)d=Math.min(d,distSeg(w,s.pts[j],s.pts[j+1]));
+  }else if(s.type==='text')d=Math.hypot(w[0]-s.p[0],w[1]-s.p[1])/2;
+  if(d<tol)return i;
+ }
+ return -1;
+}
+function moveShape(src,dx,dy){
+ var r=JSON.parse(JSON.stringify(src));
+ function mv(p){p[0]+=dx;p[1]+=dy;}
+ if(r.a)mv(r.a);
+ if(r.b)mv(r.b);
+ if(r.c)mv(r.c);
+ if(r.p)mv(r.p);
+ if(r.pts){for(var i=0;i<r.pts.length;i++)mv(r.pts[i]);}
+ return r;
+}
+function layerVis(l){var ly=layers[l];return ly?ly.vis:true;}
+function layerCol(l){var ly=layers[l];return ly?ly.col:'#1a1a1a';}
+
+// ---- отрисовка ----
+function draw(){
+ ctx.setTransform(1,0,0,1,0,0);
+ ctx.fillStyle='#f5f4ef';
+ ctx.fillRect(0,0,cv.width,cv.height);
+ ctx.setTransform(view.s,0,0,-view.s,view.ox,view.oy);
+ if(gridOn)drawGrid();
+ if(stampOn)drawStamp();
+ var i;
+ for(i=0;i<shapes.length;i++)drawShape(shapes[i],i===sel);
+ drawPreview();
+ ctx.setTransform(1,0,0,1,0,0);
+}
+function drawGrid(){
+ var step=GRID;
+ while(step*view.s<12)step*=2;
+ var x0=s2wx(0),x1=s2wx(cv.width),yb=s2wy(cv.height),yt=s2wy(0);
+ var k;
+ ctx.lineWidth=1/view.s;
+ for(k=Math.ceil(x0/step)*step;k<=x1;k+=step){
+  ctx.strokeStyle=Math.abs(k)<1e-9?'#b0aa9a':'#e2dfd5';
+  ctx.beginPath();ctx.moveTo(k,yb);ctx.lineTo(k,yt);ctx.stroke();
+ }
+ for(k=Math.ceil(yb/step)*step;k<=yt;k+=step){
+  ctx.strokeStyle=Math.abs(k)<1e-9?'#b0aa9a':'#e2dfd5';
+  ctx.beginPath();ctx.moveTo(x0,k);ctx.lineTo(x1,k);ctx.stroke();
+ }
+}
+function worldText(x,y,size,txt,align,color){
+ ctx.save();
+ ctx.setTransform(1,0,0,1,0,0);
+ ctx.font=Math.max(8,size*view.s)+'px Arial';
+ ctx.fillStyle=color||'#333';
+ ctx.textAlign=align||'left';
+ ctx.fillText(txt,w2sx(x),w2sy(y));
+ ctx.restore();
+}
+function arrow(p,ux,uy){
+ var s=4;
+ ctx.beginPath();
+ ctx.moveTo(p[0],p[1]);
+ ctx.lineTo(p[0]-ux*s-uy*s*0.25,p[1]-uy*s+ux*s*0.25);
+ ctx.lineTo(p[0]-ux*s+uy*s*0.25,p[1]-uy*s-ux*s*0.25);
+ ctx.closePath();ctx.fill();
+}
+function drawDim(s){
+ var a=s.a,b=s.b;
+ var dx=b[0]-a[0],dy=b[1]-a[1];
+ var len=Math.hypot(dx,dy);
+ if(len<0.01)return;
+ var ux=dx/len,uy=dy/len;
+ ctx.beginPath();ctx.moveTo(a[0],a[1]);ctx.lineTo(b[0],b[1]);ctx.stroke();
+ arrow(a,ux,uy);arrow(b,-ux,-uy);
+ ctx.lineWidth=1/view.s;
+ ctx.beginPath();
+ ctx.moveTo(a[0]+uy*2,a[1]-ux*2);ctx.lineTo(a[0]-uy*2,a[1]+ux*2);
+ ctx.moveTo(b[0]+uy*2,b[1]-ux*2);ctx.lineTo(b[0]-uy*2,b[1]+ux*2);
+ ctx.stroke();
+ var mx=(a[0]+b[0])/2,my=(a[1]+b[1])/2;
+ worldText(mx-uy*3,my+ux*3,3,len.toFixed(1),'center');
+}
+function drawShape(s,selected){
+ if(!layerVis(s.l))return;
+ var col=selected?'#2e86de':layerCol(s.l);
+ ctx.strokeStyle=col;
+ ctx.fillStyle=col;
+ ctx.lineWidth=(selected?2.4:1.5)/view.s;
+ ctx.beginPath();
+ if(s.type==='line'){ctx.moveTo(s.a[0],s.a[1]);ctx.lineTo(s.b[0],s.b[1]);ctx.stroke();}
+ else if(s.type==='poly'){
+  ctx.moveTo(s.pts[0][0],s.pts[0][1]);
+  for(var i=1;i<s.pts.length;i++)ctx.lineTo(s.pts[i][0],s.pts[i][1]);
+  ctx.stroke();
+ }else if(s.type==='rect'){
+  ctx.rect(s.a[0],s.a[1],s.b[0]-s.a[0],s.b[1]-s.a[1]);
+  ctx.stroke();
+ }else if(s.type==='circle'){
+  ctx.arc(s.c[0],s.c[1],Math.max(0.01,s.r),0,Math.PI*2);
+  ctx.stroke();
+ }else if(s.type==='arc'){
+  ctx.arc(s.c[0],s.c[1],Math.max(0.01,s.r),s.a1,s.a2,false);
+  ctx.stroke();
+ }else if(s.type==='text'){
+  worldText(s.p[0],s.p[1],3.5,s.t,'left',col);
+ }else if(s.type==='dim'){
+  drawDim(s);
+ }
+}
+function drawPreview(){
+ if(!drawing)return;
+ var c=layerCol(curLayer);
+ ctx.strokeStyle=c;ctx.fillStyle=c;
+ ctx.lineWidth=1.2/view.s;
+ ctx.setLineDash([5/view.s,3/view.s]);
+ ctx.beginPath();
+ var i,r,a1,a2;
+ if(drawing.type==='poly'){
+  ctx.moveTo(drawing.pts[0][0],drawing.pts[0][1]);
+  for(i=1;i<drawing.pts.length;i++)ctx.lineTo(drawing.pts[i][0],drawing.pts[i][1]);
+  ctx.lineTo(drawing.cur[0],drawing.cur[1]);
+ }else if(drawing.type==='circle'){
+  r=Math.max(0.01,Math.hypot(drawing.cur[0]-drawing.a[0],drawing.cur[1]-drawing.a[1]));
+  ctx.arc(drawing.a[0],drawing.a[1],r,0,Math.PI*2);
+ }else if(drawing.type==='arc'){
+  if(drawing.p1){
+   r=Math.hypot(drawing.p1[0]-drawing.c[0],drawing.p1[1]-drawing.c[1]);
+   a1=Math.atan2(drawing.p1[1]-drawing.c[1],drawing.p1[0]-drawing.c[0]);
+   a2=Math.atan2(drawing.cur[1]-drawing.c[1],drawing.cur[0]-drawing.c[0]);
+   ctx.arc(drawing.c[0],drawing.c[1],Math.max(0.01,r),a1,a2,false);
+  }else{
+   ctx.moveTo(drawing.c[0],drawing.c[1]);ctx.lineTo(drawing.cur[0],drawing.cur[1]);
+  }
+ }else if(tool==='rect'){
+  var b2=orthoPt(drawing.a,drawing.cur);
+  ctx.rect(Math.min(drawing.a[0],b2[0]),Math.min(drawing.a[1],b2[1]),
+   Math.abs(b2[0]-drawing.a[0]),Math.abs(b2[1]-drawing.a[1]));
+ }else{
+  ctx.moveTo(drawing.a[0],drawing.a[1]);ctx.lineTo(drawing.cur[0],drawing.cur[1]);
+ }
+ ctx.stroke();
+ ctx.setLineDash([]);
+ var pts=[];
+ if(drawing.a)pts.push(drawing.a);
+ if(drawing.c)pts.push(drawing.c);
+ if(drawing.p1)pts.push(drawing.p1);
+ if(drawing.pts){for(i=0;i<drawing.pts.length;i++)pts.push(drawing.pts[i]);}
+ for(i=0;i<pts.length;i++){ctx.beginPath();ctx.arc(pts[i][0],pts[i][1],3/view.s,0,Math.PI*2);ctx.fill();}
+}
+function drawStamp(){
+ ctx.strokeStyle='#333';
+ ctx.lineWidth=1.2/view.s;
+ ctx.strokeRect(0,0,297,210);
+ ctx.strokeRect(20,5,272,200);
+ ctx.strokeRect(107,5,185,55);
+ ctx.beginPath();
+ ctx.moveTo(107,20);ctx.lineTo(292,20);
+ ctx.moveTo(107,35);ctx.lineTo(292,35);
+ ctx.moveTo(107,50);ctx.lineTo(292,50);
+ ctx.moveTo(145,5);ctx.lineTo(145,20);
+ ctx.moveTo(195,20);ctx.lineTo(195,35);
+ ctx.moveTo(240,20);ctx.lineTo(240,35);
+ ctx.stroke();
+ worldText(110,57,4,'MiniCAD','left');
+ worldText(110,42,3,stampName,'left');
+ worldText(110,27,2.6,'Исполнитель: ______','left');
+ worldText(147,27,2.6,'Дата: ______','left');
+ worldText(197,27,2.6,'Масштаб 1:1','left');
+ worldText(242,27,2.6,'Лист 1','left');
+}
+
+// ---- статус-бар ----
+var HINTS={
+ select:'Клик - выбрать объект, тянуть - передвинуть, Del - удалить',
+ line:'Укажите первую точку отрезка',
+ poly:'Клик - первая точка контура',
+ rect:'Укажите первый угол прямоугольника',
+ circle:'Укажите центр окружности',
+ arc:'Укажите центр дуги',
+ dim:'Укажите первую точку размера',
+ text:'Кликните место для текста'
+};
+function updateStatus(){
+ document.getElementById('stXY').textContent='X: '+mouse[0].toFixed(1)+'  Y: '+mouse[1].toFixed(1);
+ document.getElementById('stZ').textContent=Math.round(view.s/2*100)+'%';
+ var h;
+ if(drawing){
+  if(drawing.type==='poly')h='Клик - следующая точка, Enter - завершить';
+  else if(drawing.type==='arc')h=drawing.p1?'Укажите конечный угол дуги':'Укажите вторую точку - радиус дуги';
+  else if(drawing.type==='dim')h='Укажите вторую точку размера';
+  else h='Укажите вторую точку, Esc - отмена';
+ }else if(tool==='select'&&sel>=0)h='Выделен объект '+(sel+1)+': Del - удалить, Массив - копии сеткой';
+ else h=HINTS[tool]||'';
+ document.getElementById('stH').textContent=h;
+}
+
+// ---- панели ----
+function showProps(){
+ var panel=document.getElementById('panel');
+ var bp=document.getElementById('boxProps');
+ var bt=document.getElementById('boxPoint');
+ var bl=document.getElementById('boxLayers');
+ bp.style.display='none';bt.style.display='none';bl.style.display='none';
+ var any=false;
+ if(layersBoxOpen){bl.style.display='block';any=true;}
+ if(tool==='select'&&sel>=0&&shapes[sel]){bp.style.display='block';any=true;}
+ else if(drawing){
+  bt.style.display='block';any=true;
+  var a=drawing.a||drawing.c||null;
+  document.getElementById('inX').value=a?a[0].toFixed(1):'';
+  document.getElementById('inY').value=a?a[1].toFixed(1):'';
+ }
+ panel.style.display=any?'block':'none';
+ if(bp.style.display==='block')renderProps();
+}
+function renderProps(){
+ var s=shapes[sel];
+ var f=document.getElementById('propFields');
+ f.innerHTML='';
+ propInputs=[];propText=null;
+ if(!s)return;
+ var fields=[],i;
+ if(s.type==='line'||s.type==='dim')fields=[['X1',s.a[0]],['Y1',s.a[1]],['X2',s.b[0]],['Y2',s.b[1]]];
+ else if(s.type==='rect')fields=[['X',s.a[0]],['Y',s.a[1]],['Ширина',s.b[0]-s.a[0]],['Высота',s.b[1]-s.a[1]]];
+ else if(s.type==='circle')fields=[['X',s.c[0]],['Y',s.c[1]],['Радиус',s.r]];
+ else if(s.type==='arc')fields=[['X',s.c[0]],['Y',s.c[1]],['Радиус',s.r],['Угол1',s.a1*180/Math.PI],['Угол2',s.a2*180/Math.PI]];
+ else if(s.type==='poly'){for(i=0;i<s.pts.length;i++){fields.push(['X'+(i+1),s.pts[i][0]]);fields.push(['Y'+(i+1),s.pts[i][1]]);}}
+ else if(s.type==='text')fields=[['X',s.p[0]],['Y',s.p[1]]];
+ for(i=0;i<fields.length;i++){
+  var lb=document.createElement('div');
+  lb.textContent=fields[i][0]+':';
+  var inp=document.createElement('input');
+  inp.type='number';inp.step='any';
+  inp.value=Math.round(fields[i][1]*100)/100;
+  f.appendChild(lb);f.appendChild(inp);
+  propInputs.push({name:fields[i][0],el:inp});
+ }
+ if(s.type==='text'){
+  var lb2=document.createElement('div');
+  lb2.textContent='Текст:';
+  propText=document.createElement('input');
+  propText.type='text';propText.value=s.t;
+  f.appendChild(lb2);f.appendChild(propText);
+ }
+}
+function applyProps(){
+ if(sel<0||!shapes[sel])return;
+ var s=shapes[sel];
+ var v={},i,val;
+ for(i=0;i<propInputs.length;i++){
+  val=parseFloat(propInputs[i].el.value);
+  if(isNaN(val))val=0;
+  v[propInputs[i].name]=val;
+ }
+ snapUndo();
+ if(s.type==='line'||s.type==='dim'){s.a=[v.X1,v.Y1];s.b=[v.X2,v.Y2];}
+ else if(s.type==='rect'){s.a=[v.X,v.Y];s.b=[v.X+v['Ширина'],v.Y+v['Высота']];}
+ else if(s.type==='circle'){s.c=[v.X,v.Y];s.r=Math.max(0,v['Радиус']);}
+ else if(s.type==='arc'){s.c=[v.X,v.Y];s.r=Math.max(0,v['Радиус']);s.a1=v['Угол1']*Math.PI/180;s.a2=v['Угол2']*Math.PI/180;}
+ else if(s.type==='poly'){for(i=0;i<s.pts.length;i++){s.pts[i][0]=v['X'+(i+1)];s.pts[i][1]=v['Y'+(i+1)];}}
+ else if(s.type==='text'){s.p=[v.X,v.Y];if(propText&&propText.value!=='')s.t=propText.value;}
+ draw();showProps();updateStatus();
+}
+function renderLayers(){
+ var box=document.getElementById('layerList');
+ box.innerHTML='';
+ var i;
+ for(i=0;i<layers.length;i++){
+  (function(idx){
+   var row=document.createElement('label');
+   var radio=document.createElement('input');
+   radio.type='radio';radio.name='lay';radio.checked=(idx===curLayer);
+   radio.addEventListener('change',function(){curLayer=idx;renderLayers();});
+   var chk=document.createElement('input');
+   chk.type='checkbox';chk.checked=layers[idx].vis;
+   chk.addEventListener('change',function(){layers[idx].vis=chk.checked;draw();});
+   var sw=document.createElement('span');
+   sw.className='sw';sw.style.background=layers[idx].col;
+   var nm=document.createElement('span');
+   nm.textContent=layers[idx].name;
+   row.appendChild(radio);row.appendChild(chk);row.appendChild(sw);row.appendChild(nm);
+   box.appendChild(row);
+  })(i);
+ }
+}
+
+// ---- файлы, экспорт, действия ----
+function download(blob,name){
+ var a=document.createElement('a');
+ a.href=URL.createObjectURL(blob);
+ a.download=name;
+ document.body.appendChild(a);
+ a.click();
+ setTimeout(function(){URL.revokeObjectURL(a.href);if(a.parentNode)a.parentNode.removeChild(a);},200);
+}
+function exportDxf(){
+ var L=['0','SECTION','2','HEADER','9','$ACADVER','1','AC1009','0','ENDSEC'];
+ L=L.concat(['0','SECTION','2','TABLES','0','ENDSEC']);
+ L=L.concat(['0','SECTION','2','ENTITIES']);
+ function e(){for(var i=0;i<arguments.length;i++)L.push(String(arguments[i]));}
+ function n(v){return Math.round(v*1000)/1000;}
+ function lay(l){var ly=layers[l];return ly?ly.name:'0';}
+ function dimText(s){var len=Math.hypot(s.b[0]-s.a[0],s.b[1]-s.a[1]);return len.toFixed(1);}
+ var i,j,s,nm;
+ for(i=0;i<shapes.length;i++){
+  s=shapes[i];nm=lay(s.l);
+  if(s.type==='line'){
+   e('0','LINE','8',nm,'10',n(s.a[0]),'20',n(s.a[1]),'11',n(s.b[0]),'21',n(s.b[1]));
+  }else if(s.type==='rect'){
+   var p=[[s.a[0],s.a[1]],[s.b[0],s.a[1]],[s.b[0],s.b[1]],[s.a[0],s.b[1]]];
+   for(j=0;j<4;j++)e('0','LINE','8',nm,'10',n(p[j][0]),'20',n(p[j][1]),'11',n(p[(j+1)%4][0]),'21',n(p[(j+1)%4][1]));
+  }else if(s.type==='circle'){
+   e('0','CIRCLE','8',nm,'10',n(s.c[0]),'20',n(s.c[1]),'40',n(s.r));
+  }else if(s.type==='arc'){
+   e('0','ARC','8',nm,'10',n(s.c[0]),'20',n(s.c[1]),'40',n(s.r),'50',n(s.a1*180/Math.PI),'51',n(s.a2*180/Math.PI));
+  }else if(s.type==='poly'){
+   for(j=0;j<s.pts.length-1;j++)e('0','LINE','8',nm,'10',n(s.pts[j][0]),'20',n(s.pts[j][1]),'11',n(s.pts[j+1][0]),'21',n(s.pts[j+1][1]));
+  }else if(s.type==='text'){
+   e('0','TEXT','8',nm,'10',n(s.p[0]),'20',n(s.p[1]),'40',3.5,'1',String(s.t));
+  }else if(s.type==='dim'){
+   e('0','LINE','8',nm,'10',n(s.a[0]),'20',n(s.a[1]),'11',n(s.b[0]),'21',n(s.b[1]));
+   e('0','TEXT','8',nm,'10',n((s.a[0]+s.b[0])/2),'20',n((s.a[1]+s.b[1])/2),'40',3,'1',dimText(s));
+  }
+ }
+ L=L.concat(['0','ENDSEC','0','EOF']);
+ download(new Blob([L.join('\r\n')],{type:'application/dxf'}),'чертех.dxf');
+}
+function exportPng(){
+ cv.toBlob(function(b){if(b)download(b,'чертёж.png');},'image/png');
+}
+function saveFile(){
+ download(new Blob([curState()],{type:'application/json'}),'чертех.minicad.json');
+}
+function openFile(ev){
+ var f=ev.target.files[0];
+ if(!f)return;
+ var rd=new FileReader();
+ rd.onload=function(){
+  try{
+   var st=JSON.parse(rd.result);
+   if(!st||!st.shapes)throw new Error('неверный формат');
+   snapUndo();
+   shapes=st.shapes;layers=st.layers||layers;
+   stampOn=!!st.stampOn;stampName=st.stampName||'Деталь';
+   if(curLayer>=layers.length)curLayer=0;
+   sel=-1;drawing=null;
+   document.getElementById('bStamp').classList.toggle('on',stampOn);
+   renderLayers();fitAll();
+  }catch(err){alert('Не удалось открыть файл: '+err.message);}
+ };
+ rd.readAsText(f,'utf-8');
+ ev.target.value='';
+}
+function delSel(){
+ if(sel<0)return;
+ snapUndo();shapes.splice(sel,1);sel=-1;showProps();draw();updateStatus();
+}
+function makeArray(){
+ if(sel<0){alert('Сначала выделите объект в режиме «Выбор»');return;}
+ var nx=parseInt(prompt('Копий по X:','1')||'0',10);
+ var ny=parseInt(prompt('Копий по Y:','1')||'0',10);
+ var sx=parseFloat(prompt('Шаг по X, мм:','20')||'0');
+ var sy=parseFloat(prompt('Шаг по Y, мм:','20')||'0');
+ if(!(nx>=1||ny>=1))return;
+ snapUndo();
+ var base=shapes[sel];
+ var i,j;
+ for(i=0;i<nx;i++)for(j=0;j<ny;j++){
+  if(i===0&&j===0)continue;
+  shapes.push(moveShape(base,i*sx,j*sy));
+ }
+ draw();updateStatus();
+}
+function toggleStamp(){
+ stampOn=!stampOn;
+ if(stampOn){
+  var n=prompt('Наименование детали (для штампа):',stampName);
+  if(n!==null&&n!=='')stampName=n;
+ }
+ document.getElementById('bStamp').classList.toggle('on',stampOn);
+ snapUndo();fitAll();
+}
+function clearAll(){
+ if(!shapes.length)return;
+ if(!confirm('Удалить все объекты?'))return;
+ snapUndo();shapes=[];sel=-1;showProps();draw();updateStatus();
+}
+function fitAll(){
+ var minx=Infinity,miny=Infinity,maxx=-Infinity,maxy=-Infinity;
+ var i,j,s;
+ function acc(p){
+  if(p[0]<minx)minx=p[0];if(p[0]>maxx)maxx=p[0];
+  if(p[1]<miny)miny=p[1];if(p[1]>maxy)maxy=p[1];
+ }
+ for(i=0;i<shapes.length;i++){
+  s=shapes[i];
+  if(s.type==='circle'){acc([s.c[0]-s.r,s.c[1]-s.r]);acc([s.c[0]+s.r,s.c[1]+s.r]);}
+  else if(s.type==='arc')acc(s.c);
+  else if(s.type==='poly'){for(j=0;j<s.pts.length;j++)acc(s.pts[j]);}
+  else if(s.type==='text')acc(s.p);
+  else{acc(s.a);acc(s.b);}
+ }
+ if(stampOn){minx=Math.min(minx,0);miny=Math.min(miny,0);maxx=Math.max(maxx,297);maxy=Math.max(maxy,210);}
+ if(!isFinite(minx)){minx=0;miny=0;maxx=140;maxy=100;}
+ var sc=Math.min(cv.width/(maxx-minx+20),cv.height/(maxy-miny+20));
+ if(!isFinite(sc)||sc<=0)sc=2;
+ sc=Math.max(0.02,Math.min(200,sc));
+ view.s=sc;
+ view.ox=(10-minx)*sc;
+ view.oy=(maxy+10)*sc;
+ draw();updateStatus();
+}
+function putPoint(){
+ if(!drawing)return;
+ var x=parseFloat(document.getElementById('inX').value);
+ var y=parseFloat(document.getElementById('inY').value);
+ if(isNaN(x)||isNaN(y))return;
+ toolDown([x,y]);
+}
+function setTool(t){
+ if(drawing&&drawing.type==='poly')endPoly();
+ drawing=null;
+ tool=t;
+ var tb=document.querySelectorAll('#toolbar button[data-tool]');
+ var i;
+ for(i=0;i<tb.length;i++){
+  if(tb[i].getAttribute('data-tool')===t)tb[i].classList.add('on');
+  else tb[i].classList.remove('on');
+ }
+ cv.style.cursor=(t==='select')?'default':'crosshair';
+ showProps();draw();updateStatus();
+}
+
+// ---- привязка кнопок и запуск ----
+(function bind(){
+ var i,b;
+ var tb=document.querySelectorAll('#toolbar button[data-tool]');
+ for(i=0;i<tb.length;i++){
+  (function(btn){
+   btn.addEventListener('click',function(){setTool(btn.getAttribute('data-tool'));});
+  })(tb[i]);
+ }
+ b=document.getElementById('bGrid');
+ b.addEventListener('click',function(){gridOn=!gridOn;b.classList.toggle('on',gridOn);draw();});
+ b=document.getElementById('bOrtho');
+ b.addEventListener('click',function(){orthoOn=!orthoOn;b.classList.toggle('on',orthoOn);});
+ b=document.getElementById('bSnap');
+ b.addEventListener('click',function(){snapOn=!snapOn;b.classList.toggle('on',snapOn);});
+ document.getElementById('bUndo').addEventListener('click',undo);
+ document.getElementById('bRedo').addEventListener('click',redo);
+ document.getElementById('bDel').addEventListener('click',delSel);
+ document.getElementById('bArr').addEventListener('click',makeArray);
+ b=document.getElementById('bLayers');
+ b.addEventListener('click',function(){layersBoxOpen=!layersBoxOpen;b.classList.toggle('on',layersBoxOpen);showProps();});
+ document.getElementById('bStamp').addEventListener('click',toggleStamp);
+ document.getElementById('bDxf').addEventListener('click',exportDxf);
+ document.getElementById('bPng').addEventListener('click',exportPng);
+ document.getElementById('bSave').addEventListener('click',saveFile);
+ document.getElementById('bOpen').addEventListener('click',function(){document.getElementById('fileIn').click();});
+ document.getElementById('bFit').addEventListener('click',fitAll);
+ document.getElementById('bClear').addEventListener('click',clearAll);
+ document.getElementById('bApply').addEventListener('click',applyProps);
+ document.getElementById('bPt').addEventListener('click',putPoint);
+ document.getElementById('bEnd').addEventListener('click',endPoly);
+ document.getElementById('fileIn').addEventListener('change',openFile);
+})();
+
+renderLayers();
+resize();
+fitAll();
+updateStatus();
+</script>
+</body>
+</html>
